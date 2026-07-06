@@ -3,11 +3,6 @@
   // Never put your SECRET key in this file — it must only live on a server.
   var PAYSTACK_PUBLIC_KEY = 'pk_test_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
 
-  // ---------- Admin panel ----------
-  // NOTE: this is a client-side gate only (a convenience UI), not real security — anyone who
-  // views this page's source can read this password. Don't use it to protect anything sensitive.
-  var ADMIN_PASSWORD = 'NBA123DR';
-
   function pad(n){return n.toString().padStart(2,'0');}
   var prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -88,6 +83,22 @@
     });
   }
 
+  function buildPreorderCards(){
+    var wrap = document.getElementById('preorderGrid');
+    if(!wrap) return;
+    wrap.innerHTML = '';
+    PRODUCTS.forEach(function(p){
+      var card = document.createElement('div');
+      card.className = 'preorder-card';
+      card.innerHTML =
+        '<div class="pin" aria-hidden="true">' + p.initials + '</div>' +
+        '<div class="name">' + p.name + '</div>' +
+        '<div class="meta"><span>' + p.meta + '</span><b>GHS ' + p.price + '</b></div>' +
+        '<button class="preorder-buy" type="button" disabled>Coming Soon</button>';
+      wrap.appendChild(card);
+    });
+  }
+
   function computeRadius(){
     var w = window.innerWidth;
     if(w < 600) return 210;
@@ -161,6 +172,7 @@
 
   buildCards();
   buildDots();
+  buildPreorderCards();
   layout();
   startAuto();
 
@@ -186,19 +198,18 @@
     var countdownWrap = document.getElementById('countdownWrap');
     var dropBadge = document.getElementById('dropBadge');
     var buyBtn = document.getElementById('leBuyBtn');
-    if(live){
+    if(soldOut){
+      if(dropBadge) dropBadge.textContent = 'Sold Out';
+      if(buyBtn) buyBtn.style.display = 'none';
+    } else if(live){
       if(notifyFormWrap) notifyFormWrap.style.display = 'none';
       if(notifyHint) notifyHint.style.display = 'none';
       if(countdownWrap) countdownWrap.style.display = 'none';
-      if(soldOut){
-        if(dropBadge) dropBadge.textContent = 'Sold Out';
-        if(buyBtn) buyBtn.style.display = 'none';
-      } else {
-        if(dropBadge) dropBadge.textContent = 'Available Now';
-        if(buyBtn) buyBtn.style.display = 'inline-flex';
-      }
+      if(dropBadge) dropBadge.textContent = 'Available Now';
+      if(buyBtn){ buyBtn.textContent = 'Buy Now — GHS ' + LE_PRODUCT.price; buyBtn.style.display = 'inline-flex'; buyBtn.disabled = false; }
     } else {
-      if(buyBtn) buyBtn.style.display = 'none';
+      // Pre-order not open yet — shown as a disabled Coming Soon state.
+      if(buyBtn){ buyBtn.textContent = 'Pre-order — Coming Soon'; buyBtn.style.display = 'inline-flex'; buyBtn.disabled = true; }
     }
     updateStockIndicator();
   }
@@ -219,13 +230,26 @@
   }
 
   refreshDropState();
-  updateCountdown();
-  setInterval(updateCountdown, 1000);
+  // Countdown is intentionally paused at 00:00:00:00 (not ticking) — the cd-unit spans
+  // default to "00" in the markup below and are left untouched here.
 
   var leBuyBtn = document.getElementById('leBuyBtn');
   if(leBuyBtn){
     leBuyBtn.addEventListener('click', function(){
-      if(isDropLive() && LE_STATE.stock > 0) openCheckout(LE_PRODUCT);
+      if(LE_STATE.stock > 0) openCheckout(LE_PRODUCT);
+    });
+  }
+
+  // ---------- Site email routing ----------
+  // All form submissions (notify signups, contact messages, order notifications) go to this address
+  // via FormSubmit (no backend required). First submission after going live triggers a one-time
+  // confirmation email to this address — it must be clicked once to activate delivery.
+  var SITE_EMAIL = 'caseyfoatykvs@gmail.com';
+  function sendFormEmail(formData){
+    return fetch('https://formsubmit.co/ajax/' + SITE_EMAIL, {
+      method: 'POST',
+      headers: { 'Accept': 'application/json' },
+      body: formData
     });
   }
 
@@ -236,10 +260,34 @@
       var emailInput = document.getElementById('notifyEmail');
       var email = emailInput.value.trim();
       if(!email) return;
-      // NOTE: this only confirms in the browser. To really collect and send these emails,
-      // point this form at a real email service (Formspree, Mailchimp, ConvertKit, etc).
-      showToast('You are on the list — we will email you at drop time.');
-      notifyFormEl.reset();
+      var urlField = document.getElementById('notifyFormUrl');
+      if(urlField) urlField.value = window.location.href;
+      sendFormEmail(new FormData(notifyFormEl)).then(function(res){
+        if(!res.ok) throw new Error('request failed');
+        showToast('You are on the list — we will email you at drop time.');
+        notifyFormEl.reset();
+      }).catch(function(){
+        showToast('Something went wrong — please try again.');
+      });
+    });
+  }
+
+  var contactFormEl = document.getElementById('contactForm');
+  if(contactFormEl){
+    contactFormEl.addEventListener('submit', function(e){
+      e.preventDefault();
+      var btn = contactFormEl.querySelector('.submit-btn');
+      var originalLabel = btn.textContent;
+      var urlField = document.getElementById('contactFormUrl');
+      if(urlField) urlField.value = window.location.href;
+      sendFormEmail(new FormData(contactFormEl)).then(function(res){
+        if(!res.ok) throw new Error('request failed');
+        btn.textContent = 'Sent ✓';
+        contactFormEl.reset();
+        setTimeout(function(){ btn.textContent = originalLabel; }, 4000);
+      }).catch(function(){
+        showToast('Message did not send — please try again or email us directly.');
+      });
     });
   }
 
@@ -263,6 +311,7 @@
   document.getElementById('checkoutForm').addEventListener('submit', function(e){
     e.preventDefault();
     if(!checkoutProduct) return;
+    var product = checkoutProduct; // captured now — closeCheckout() below nulls checkoutProduct
     var email = document.getElementById('checkoutEmail').value.trim();
     if(!email) return;
     if(typeof PaystackPop === 'undefined'){
@@ -272,13 +321,22 @@
     var handler = PaystackPop.setup({
       key: PAYSTACK_PUBLIC_KEY,
       email: email,
-      amount: checkoutProduct.price * 100, // GHS to pesewas
+      amount: product.price * 100, // GHS to pesewas
       currency: 'GHS',
       ref: 'AFTER9-' + Date.now() + '-' + Math.floor(Math.random() * 100000),
-      metadata: { custom_fields: [{ display_name: 'Product', variable_name: 'product', value: checkoutProduct.name }] },
+      metadata: { custom_fields: [{ display_name: 'Product', variable_name: 'product', value: product.name }] },
       callback: function(response){
         closeCheckout();
         showToast('Payment received — ref ' + response.reference);
+        var orderData = new FormData();
+        orderData.append('_subject', 'New AFTER9 order — ' + product.name);
+        orderData.append('_template', 'table');
+        orderData.append('_url', window.location.href);
+        orderData.append('product', product.name);
+        orderData.append('price', 'GHS ' + product.price);
+        orderData.append('customer_email', email);
+        orderData.append('reference', response.reference);
+        sendFormEmail(orderData).catch(function(){});
       },
       onClose: function(){}
     });
@@ -292,73 +350,10 @@
     setTimeout(function(){ t.classList.remove('show'); }, 4200);
   }
 
-  // ---------- Mystery-drop photo blur + stock ----------
-  function applyLEPhotoBlur(){
-    document.querySelectorAll('.le-photo').forEach(function(img){
-      img.classList.toggle('blurred', LE_STATE.blurred);
-    });
-  }
+  // ---------- Mystery-drop stock ----------
   function updateStockIndicator(){
     var el = document.getElementById('stockIndicator');
     if(!el) return;
     el.innerHTML = LE_STATE.stock <= 0 ? '<b>Sold out</b>' : '<b>' + LE_STATE.stock + '</b> of 99 left';
   }
   updateStockIndicator();
-
-  // ---------- Admin panel ----------
-  function toLocalDatetimeInputValue(isoString){
-    var d = new Date(isoString);
-    var pad2 = function(n){ return String(n).padStart(2, '0'); };
-    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-  }
-
-  var adminOverlay = document.getElementById('adminOverlay');
-
-  function openAdmin(){
-    adminOverlay.classList.add('open');
-    document.getElementById('adminPassword').value = '';
-    document.getElementById('adminError').style.display = 'none';
-    document.getElementById('adminLocked').style.display = 'block';
-    document.getElementById('adminPanel').style.display = 'none';
-    document.getElementById('adminPassword').focus();
-  }
-  function closeAdmin(){ adminOverlay.classList.remove('open'); }
-
-  function populateAdminPanel(){
-    document.getElementById('adminBlurToggle').checked = LE_STATE.blurred;
-    document.getElementById('adminStock').value = LE_STATE.stock;
-    document.getElementById('adminForceLive').checked = DROP_CONFIG.forceUnlock;
-    document.getElementById('adminDropDate').value = toLocalDatetimeInputValue(DROP_CONFIG.dropDate);
-  }
-
-  document.getElementById('adminTrigger').addEventListener('click', openAdmin);
-  document.getElementById('adminClose').addEventListener('click', closeAdmin);
-  adminOverlay.addEventListener('click', function(e){ if(e.target === adminOverlay) closeAdmin(); });
-  document.addEventListener('keydown', function(e){ if(e.key === 'Escape' && adminOverlay.classList.contains('open')) closeAdmin(); });
-
-  document.getElementById('adminPasswordForm').addEventListener('submit', function(e){
-    e.preventDefault();
-    var pw = document.getElementById('adminPassword').value;
-    if(pw === ADMIN_PASSWORD){
-      document.getElementById('adminLocked').style.display = 'none';
-      document.getElementById('adminPanel').style.display = 'block';
-      populateAdminPanel();
-    } else {
-      document.getElementById('adminError').style.display = 'block';
-    }
-  });
-
-  document.getElementById('adminApply').addEventListener('click', function(){
-    LE_STATE.blurred = document.getElementById('adminBlurToggle').checked;
-    LE_STATE.stock = Math.max(0, Math.min(99, parseInt(document.getElementById('adminStock').value, 10) || 0));
-    DROP_CONFIG.forceUnlock = document.getElementById('adminForceLive').checked;
-    var dateVal = document.getElementById('adminDropDate').value;
-    if(dateVal){
-      var parsed = new Date(dateVal);
-      if(!isNaN(parsed.getTime())) DROP_CONFIG.dropDate = parsed.toISOString();
-    }
-    applyLEPhotoBlur();
-    refreshDropState();
-    updateCountdown();
-    showToast('Preview updated for this browser tab.');
-  });
